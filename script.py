@@ -14,12 +14,8 @@ import os
 SEUIL_REMPLISSAGE = 0.4 
 
 # Coordonnées estimées (X, Y, Largeur, Hauteur) pour l'en-tête
-ZONE_IDENTITE = (600, 200, 1800, 400)
-
-
-
-
-
+#ZONE_IDENTITE = (600, 200, 1800, 400)
+ZONE_IDENTITE = (0.24, 0.05, 0.72, 0.12)
 
 def traiter_pdf(chemin_pdf):
     """Convertit le PDF en images."""
@@ -34,9 +30,14 @@ def est_cochee(img_binaire, x, y, w, h):
     ratio = pixels_blancs / total_pixels
     return ratio > SEUIL_REMPLISSAGE
 
-def extraire_texte(image_couleur, x, y, x2, y2):
+def extraire_texte(image_couleur,h, w, rel_x1, rel_y1, rel_x2, rel_y2):
     """Extrait le texte à partir de l'image BGR originale."""
     # Découpage du bloc identité
+  
+
+    x, x2 = int(rel_x1 * w), int(rel_x2 * w)
+    y, y2 = int(rel_y1 * h), int(rel_y2 * h)
+
     roi = image_couleur[y:y2, x:x2]
     
     # Sécurité si le ROI est vide
@@ -59,47 +60,94 @@ def extraire_texte(image_couleur, x, y, x2, y2):
 
     return num_etudiant, nom_prenom
 
-def detecter_lignes_y(binaire_omr):
-    h, w = binaire_omr.shape
+def detecter_lignes_y(binaire_omr, w):
+    
     # 1. Analyse de la bande de synchronisation à droite
-    # On cible la zone où se trouvent les rectangles noirs (ticks)
-    # bande_droite = binaire_omr[:, w-70:w-10]
-    largeur_bande = int(w * 0.05) 
-    bande_droite = binaire_omr[:, w - largeur_bande:]
-    # Projection horizontale : on compte les pixels noirs (0) ou blancs (255) 
-    # selon si votre image est inversée. Ici on suppose 255 = blanc (le tick).
-    projection_noir = np.mean(bande_droite, axis=1)/ 255
+    bande_start = int(w * 0.961) 
+    band_end = int(w * 0.986)
+
+    bande_droite = binaire_omr[:, bande_start:band_end]
     
-    # On considère que c'est un tick si plus de 50% de la largeur de la bande est noire
-    seuil = projection_noir > 0.5 # bande_droite.shape[1] * 0.5
-    seuillage_ticks = projection_noir > seuil
+    # Projection horizontale : on normalise entre 0 et 1
+    # On suppose que 255 (blanc) est la couleur du tick
+    projection_noir = np.mean(bande_droite, axis=1) / 255
+    
+    # 2. Seuillage
+    # On obtient un tableau de booléens (True si c'est un pixel de tick)
+    seuillage_ticks = projection_noir > 0.5 
+    
     tous_les_ticks = []
-    current_y_sum, count = 0, 0
+    y_debut = None
+    count = 0
     
-    # 2. Identification des centres des blocs noirs
-    # 3. Parcours des lignes
+    # 3. Identification des blocs (début et fin)
     for y, is_tick in enumerate(seuillage_ticks):
         if is_tick:
-            current_y_sum += y
+            if count == 0:
+                y_debut = y  # On enregistre le premier pixel du bloc
             count += 1
         elif count > 0:
-            # FILTRE DE TAILLE : Un vrai tick fait entre 3 et 25 pixels de haut
-            # Cela permet d'éliminer les 2 marques parasites (poussières de 1px)
+            # On vient de sortir d'un bloc noir
+            y_fin = y - 1  # La fin est le pixel juste avant le changement
+            
+            # FILTRE DE TAILLE : on vérifie la hauteur du bloc trouvé
             if 10 < count < 100:
-                tous_les_ticks.append(int(current_y_sum / count))
-            current_y_sum, count = 0, 0
-
-    # --- FILTRAGE POUR 43 MARQUES ---
-    # Structure : [2 Start] + [40 Lignes de questions] + [1 Final] = 43
-    
+                # On ajoute un tuple (début, fin)
+                tous_les_ticks.append((y_debut, y_fin))
+            
+            # Réinitialisation pour le prochain bloc
+            count = 0
+            y_debut = None
+    # --- GESTION DU RETOUR ---
+    # Structure attendue : 43 marques
     if len(tous_les_ticks) >= 43:
-        # On renvoie une liste plate des 43 premières coordonnées Y
         return tous_les_ticks[:43]
     else:
         print(f"Attention : {len(tous_les_ticks)} marques trouvées au lieu de 43.")
-        # On renvoie quand même ce qu'on a trouvé, ou une liste vide selon votre besoin
         return tous_les_ticks
     
+def detecter_colonnes_x(binaire_omr, w,paires_y):
+    # 1. On définit la zone verticale globale des questions
+    # On ignore les 2 premiers ticks (Start) et le dernier (Final) pour n'avoir que les questions
+    y_start = paires_y[2][0] 
+    y_end = paires_y[-1][0]
+    
+    zone_questions = binaire_omr[y_start:y_end, :int(w * 0.961) ]
+    h_zone, w_zone = zone_questions.shape
+
+
+    # 2. Projection verticale : on fait la moyenne sur la hauteur
+    # Comme l'encre est blanche (255), les colonnes de cases créeront des "pics"
+    kernel = np.ones((1, int(w * 0.02)), np.uint8)
+    zone_fusionnee = cv2.dilate(zone_questions, kernel, iterations=1)
+    projection = np.mean(zone_fusionnee, axis=0) / 255
+    
+    # 3. Seuillage pour identifier les zones de texte/cases
+    # Un seuil de 0.02 (2% de pixels blancs sur la colonne) suffit souvent
+    seuil = 0.02
+    colonnes_actives = projection > seuil
+    
+    paires_x = []
+    x_debut = None
+    en_colonne = False
+
+    for x, actif in enumerate(colonnes_actives):
+            if actif and not en_colonne:
+                x_debut = x
+                en_colonne = True
+            elif not actif and en_colonne:
+                largeur = x - x_debut
+                # Une colonne de questions sur ce type de document fait 
+                # environ 15-18% de la largeur totale. On filtre les parasites < 100px.
+                #if largeur > 100:
+                paires_x.append((x_debut, x))
+                en_colonne = False
+                
+        # Sécurité : on attend 5 colonnes
+    if len(paires_x) != 5:
+        print(f"Attention : {len(paires_x)} colonnes trouvées. Vérifiez le seuil.")
+        
+    return paires_x 
 
 def analyser_feuille(image_cv):
     """Analyse une image de grille QCM."""
@@ -109,47 +157,78 @@ def analyser_feuille(image_cv):
     gris = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
     flou = cv2.GaussianBlur(gris, (5, 5), 0)
     _, binaire_omr = cv2.threshold(flou, 150, 255, cv2.THRESH_BINARY_INV)
-
+    h, w = image_cv.shape[:2]
     # 2. Extraction de l'en-tête (On envoie l'image COULEUR ici)
-    num_etudiant, nom_prenom = extraire_texte(image_cv, *ZONE_IDENTITE)
+    num_etudiant, nom_prenom = extraire_texte(image_cv, h, w, *ZONE_IDENTITE)
 
-    paires_y = detecter_lignes_y(binaire_omr)
+    paires_y = detecter_lignes_y(binaire_omr, w)
+    paires_x = detecter_colonnes_x(binaire_omr, w, paires_y)
 
-    X_BLOCS = [115, 595, 1075, 1555, 2035] 
-    DX_CASE = 52
-    DX_REPENTIR = 65
-    TAILLE_CASE = 28
+    # début a 10 fin a 149
+    # numéro question 13 a 39
+    # bloc repantance 23 a 39
+    # bloc de questions 44 a 60
+    # espace entre les questions 61 a 65 
+
+
+    # --- DEFINITION DES RATIOS (basés sur tes mesures) ---
+    RATIO_REPENTIR = 0.151
+    RATIO_A = 0.302
+    RATIO_PAS = 0.151
+    # Taille de la zone de lecture (environ 12% de la largeur du bloc)
+    TAILLE_REL = 0.12
 
     # 3. Extraction des QCM
-    for bloc_idx, base_x in enumerate(X_BLOCS):
-            for ligne_idx, (y_l1, y_l2) in enumerate(paires_y):
-                q = (bloc_idx * 20) + (ligne_idx + 1)
-                
-                # --- LECTURE LIGNE 1 (Y_L1 détecté par la marque noire 1) ---
-                res_l1 = [est_cochee(binaire_omr, base_x + (i*DX_CASE), y_l1, TAILLE_CASE, TAILLE_CASE) for i in range(5)]
-                
+    # On parcourt les 5 blocs de colonnes
+    for bloc_idx, (x_start, x_end) in enumerate(paires_x):
+        # On parcourt les 20 questions du bloc
+        # On commence à l'index 2 (saute les 2 start ticks) jusqu'à 41
+        for q_in_col in range(20):
+            q_numero = (bloc_idx * 20) + (q_in_col + 1)
+            
+            # Récupération des indices des deux lignes Y pour cette question
+            idx_l1 = 2 + (q_in_col * 2)
+            idx_l2 = idx_l1 + 1
+            
+            # Calcul du centre Y des deux lignes
+            y_l1 = (paires_y[idx_l1][0] + paires_y[idx_l1][1]) // 2
+            y_l2 = (paires_y[idx_l2][0] + paires_y[idx_l2][1]) // 2
+            
+            # Coordonnée X de base pour la case 'A'
+            # On prend le début du bloc X détecté + un petit décalage pour être au centre du A
+            base_x = x_start + OFFSET_A
+
+            # --- LECTURE LIGNE 1 ---
+            res_l1 = [
+                est_cochee(binaire_omr, base_x + (i * DX_CASE), y_l1, TAILLE_CASE, TAILLE_CASE) 
+                for i in range(5)
+            ]
+            
+            donnees_feuille.append({
+                'numéro étudiants': num_etudiant, 'nom': nom_prenom, 'question': q_numero,
+                'ligne réponse': 1, 'repentance': False,
+                'Réponse A': res_l1[0], 'Réponse B': res_l1[1], 'Réponse C': res_l1[2], 
+                'Réponse D': res_l1[3], 'Réponse E': res_l1[4]
+            })
+            
+            # --- LECTURE LIGNE 2 (Repentir) ---
+            # Le repentir est à gauche de la case A
+            x_rep = base_x - DX_REPENTIR
+            repentir = est_cochee(binaire_omr, x_rep, y_l2, TAILLE_CASE, TAILLE_CASE)
+            
+            res_l2 = [
+                est_cochee(binaire_omr, base_x + (i * DX_CASE), y_l2, TAILLE_CASE, TAILLE_CASE) 
+                for i in range(5)
+            ]
+            
+            # On n'ajoute la ligne 2 que si elle contient une marque
+            if repentir or any(res_l2):
                 donnees_feuille.append({
-                    'numéro étudiants': num_etudiant, 'nom': nom_prenom, 'question': q,
-                    'ligne réponse': 1, 'repentance': False,
-                    'Réponse A': res_l1[0], 'Réponse B': res_l1[1], 'Réponse C': res_l1[2], 
-                    'Réponse D': res_l1[3], 'Réponse E': res_l1[4]
+                    'numéro étudiants': num_etudiant, 'nom': nom_prenom, 'question': q_numero,
+                    'ligne réponse': 2, 'repentance': repentir,
+                    'Réponse A': res_l2[0], 'Réponse B': res_l2[1], 'Réponse C': res_l2[2], 
+                    'Réponse D': res_l2[3], 'Réponse E': res_l2[4]
                 })
-                
-                # --- LECTURE LIGNE 2 (Y_L2 détecté par la marque noire 2) ---
-                # Lecture de la case de repentir (à gauche)
-                repentir = est_cochee(binaire_omr, base_x - DX_REPENTIR, y_l2, TAILLE_CASE, TAILLE_CASE)
-                
-                # Lecture des cases A,B,C,D,E de la ligne 2
-                res_l2 = [est_cochee(binaire_omr, base_x + (i*DX_CASE), y_l2, TAILLE_CASE, TAILLE_CASE) for i in range(5)]
-                
-                # On n'ajoute la ligne 2 au CSV que si elle a été utilisée
-                if repentir or any(res_l2):
-                    donnees_feuille.append({
-                        'numéro étudiants': num_etudiant, 'nom': nom_prenom, 'question': q,
-                        'ligne réponse': 2, 'repentance': repentir,
-                        'Réponse A': res_l2[0], 'Réponse B': res_l2[1], 'Réponse C': res_l2[2], 
-                        'Réponse D': res_l2[3], 'Réponse E': res_l2[4]
-                    })
 
     return donnees_feuille
 
