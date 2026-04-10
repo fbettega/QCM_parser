@@ -21,14 +21,27 @@ def traiter_pdf(chemin_pdf):
     """Convertit le PDF en images."""
     return convert_from_path(chemin_pdf, dpi=300)
 
-def est_cochee(img_binaire, x, y, w, h):
-    """Vérifie si une case spécifique est cochée en comptant les pixels noirs."""
-    roi = img_binaire[y:y+h, x:x+w]
-    total_pixels = w * h
-    # Dans img_binaire (inversée), les marques noires sont blanches (255)
+def est_cochee(img_binaire, x_centre, y_centre, w, h):
+    """Vérifie si une case est cochée en centrant la zone de lecture."""
+    # On recule de la moitié de la largeur/hauteur pour centrer
+    x1 = int(x_centre - w // 2)
+    y1 = int(y_centre - h // 2)
+    x2 = x1 + w
+    y2 = y1 + h
+
+    # Extraction sécurisée (pour ne pas sortir des limites de l'image)
+    roi = img_binaire[max(0, y1):y2, max(0, x1):x2]
+    
+    if roi.size == 0:
+        return False
+
+    total_pixels = roi.shape[0] * roi.shape[1]
     pixels_blancs = cv2.countNonZero(roi)
+    
     ratio = pixels_blancs / total_pixels
-    return ratio > SEUIL_REMPLISSAGE
+    
+    # Seuil à 0.20 ou 0.25 pour être réactif
+    return ratio > 0.20
 
 def extraire_texte(image_couleur,h, w, rel_x1, rel_y1, rel_x2, rel_y2):
     """Extrait le texte à partir de l'image BGR originale."""
@@ -179,56 +192,52 @@ def analyser_feuille(image_cv):
     TAILLE_REL = 0.12
 
     # 3. Extraction des QCM
-    # On parcourt les 5 blocs de colonnes
     for bloc_idx, (x_start, x_end) in enumerate(paires_x):
-        # On parcourt les 20 questions du bloc
-        # On commence à l'index 2 (saute les 2 start ticks) jusqu'à 41
+        largeur_col = x_end - x_start
+        
+        # Taille de lecture adaptée à la résolution du scan
+        tw = th = int(largeur_col * TAILLE_REL)
+
         for q_in_col in range(20):
             q_numero = (bloc_idx * 20) + (q_in_col + 1)
             
-            # Récupération des indices des deux lignes Y pour cette question
             idx_l1 = 2 + (q_in_col * 2)
             idx_l2 = idx_l1 + 1
-            
-            # Calcul du centre Y des deux lignes
+            if idx_l2 >= len(paires_y): break
+
             y_l1 = (paires_y[idx_l1][0] + paires_y[idx_l1][1]) // 2
             y_l2 = (paires_y[idx_l2][0] + paires_y[idx_l2][1]) // 2
-            
-            # Coordonnée X de base pour la case 'A'
-            # On prend le début du bloc X détecté + un petit décalage pour être au centre du A
-            base_x = x_start + OFFSET_A
 
-            # --- LECTURE LIGNE 1 ---
-            res_l1 = [
-                est_cochee(binaire_omr, base_x + (i * DX_CASE), y_l1, TAILLE_CASE, TAILLE_CASE) 
+            # --- CALCUL DES X PAR RATIO ---
+            x_rep = int(x_start + (largeur_col * RATIO_REPENTIR))
+            
+            # Centres des cases A, B, C, D, E
+            centres_x_abcde = [
+                int(x_start + (largeur_col * (RATIO_A + i * RATIO_PAS)))
                 for i in range(5)
             ]
-            
+
+            # --- LECTURE ---
+            res_l1 = [est_cochee(binaire_omr, cx, y_l1, tw, th) for cx in centres_x_abcde]
+ 
             donnees_feuille.append({
                 'numéro étudiants': num_etudiant, 'nom': nom_prenom, 'question': q_numero,
                 'ligne réponse': 1, 'repentance': False,
                 'Réponse A': res_l1[0], 'Réponse B': res_l1[1], 'Réponse C': res_l1[2], 
                 'Réponse D': res_l1[3], 'Réponse E': res_l1[4]
             })
-            
-            # --- LECTURE LIGNE 2 (Repentir) ---
-            # Le repentir est à gauche de la case A
-            x_rep = base_x - DX_REPENTIR
-            repentir = est_cochee(binaire_omr, x_rep, y_l2, TAILLE_CASE, TAILLE_CASE)
-            
-            res_l2 = [
-                est_cochee(binaire_omr, base_x + (i * DX_CASE), y_l2, TAILLE_CASE, TAILLE_CASE) 
-                for i in range(5)
-            ]
-            
-            # On n'ajoute la ligne 2 que si elle contient une marque
-            if repentir or any(res_l2):
-                donnees_feuille.append({
-                    'numéro étudiants': num_etudiant, 'nom': nom_prenom, 'question': q_numero,
-                    'ligne réponse': 2, 'repentance': repentir,
-                    'Réponse A': res_l2[0], 'Réponse B': res_l2[1], 'Réponse C': res_l2[2], 
-                    'Réponse D': res_l2[3], 'Réponse E': res_l2[4]
-                })
+
+            # Ligne 2 (Repentir)
+            is_rep_coche = est_cochee(binaire_omr, x_rep, y_l2, tw, th)
+            res_l2 = [est_cochee(binaire_omr, cx, y_l2, tw, th) for cx in centres_x_abcde]
+
+            # if is_rep_coche or any(res_l2):
+            donnees_feuille.append({
+                'numéro étudiants': num_etudiant, 'nom': nom_prenom, 'question': q_numero,
+                'ligne réponse': 2, 'repentance': is_rep_coche,
+                'Réponse A': res_l2[0], 'Réponse B': res_l2[1], 'Réponse C': res_l2[2], 
+                'Réponse D': res_l2[3], 'Réponse E': res_l2[4]
+            })
 
     return donnees_feuille
 

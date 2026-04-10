@@ -18,6 +18,6 @@ for i in range(0, img.shape[0], 100):
     cv2.line(img, (0, i), (img.shape[1], i), (200, 200, 200), 1)
 
 # 3. SAUVEGARDER au lieu d'afficher
-cv2.imwrite("test_calibration.jpg", img)
+cv2.imwrite("data/test_calibration.jpg", img)
 
 print("Image 'test_calibration.jpg' générée. Ouvre-la pour vérifier l'encadré vert.")
