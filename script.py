@@ -15,11 +15,56 @@ SEUIL_REMPLISSAGE = 0.4
 
 # Coordonnées estimées (X, Y, Largeur, Hauteur) pour l'en-tête
 #ZONE_IDENTITE = (600, 200, 1800, 400)
-ZONE_IDENTITE = (0.24, 0.05, 0.72, 0.12)
+# 81 et 115 sur 1224
+
+ZONE_IDENTITE = (0.06, 0.10)
 
 def traiter_pdf(chemin_pdf):
     """Convertit le PDF en images."""
     return convert_from_path(chemin_pdf, dpi=300)
+
+def redresser_image(image_cv):
+    """Détecte l'inclinaison de l'image et la redresse."""
+    # 1. Conversion en gris et détection de bords
+    gris = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
+    bords = cv2.Canny(gris, 50, 150, apertureSize=3)
+
+    # 2. Détection des lignes avec la transformée de Hough
+    # On cherche des lignes assez longues (> 100px)
+    lignes = cv2.HoughLinesP(bords, 1, np.pi / 180, threshold=100, minLineLength=100, maxLineGap=10)
+
+    angles = []
+    if lignes is not None:
+        for ligne in lignes:
+            x1, y1, x2, y2 = ligne[0]
+            angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+            
+            # On ne garde que les lignes quasi-horizontales (entre -10 et 10 deg)
+            # ou quasi-verticales (on les remet sur l'axe horizontal pour la moyenne)
+            if -10 < angle < 10:
+                angles.append(angle)
+            elif 80 < angle < 100:
+                angles.append(angle - 90)
+            elif -100 < angle < -80:
+                angles.append(angle + 90)
+
+    # 3. Calcul de l'angle médian (plus robuste que la moyenne)
+    if len(angles) > 0:
+        angle_final = np.median(angles)
+    else:
+        angle_final = 0
+
+    # 4. Rotation de l'image pour la remettre droite
+    (h, w) = image_cv.shape[:2]
+    centre = (w // 2, h // 2)
+    matrice = cv2.getRotationMatrix2D(centre, angle_final, 1.0)
+    image_rectifiee = cv2.warpAffine(image_cv, matrice, (w, h), 
+                                     flags=cv2.INTER_CUBIC, 
+                                     borderMode=cv2.BORDER_CONSTANT, 
+                                     borderValue=(255, 255, 255)) # Fond blanc
+
+    return image_rectifiee, angle_final
+
 
 def est_cochee(img_binaire, x_centre, y_centre, w, h):
     """Vérifie si une case est cochée en centrant la zone de lecture."""
@@ -41,39 +86,53 @@ def est_cochee(img_binaire, x_centre, y_centre, w, h):
     ratio = pixels_blancs / total_pixels
     
     # Seuil à 0.20 ou 0.25 pour être réactif
-    return ratio > 0.20
+    return ratio > 0.10
 
-def extraire_texte(image_couleur,h, w, rel_x1, rel_y1, rel_x2, rel_y2):
-    """Extrait le texte à partir de l'image BGR originale."""
-    # Découpage du bloc identité
-  
-
-    x, x2 = int(rel_x1 * w), int(rel_x2 * w)
-    y, y2 = int(rel_y1 * h), int(rel_y2 * h)
-
-    roi = image_couleur[y:y2, x:x2]
+def extraire_texte(image_couleur, h, w,  rel_y1, rel_y2):
+    """Extrait le texte et sépare intelligemment chiffres et lettres."""
     
-    # Sécurité si le ROI est vide
+    # 1. Découpage du bloc identité
+    y1, y2 = int(rel_y1 * h), int(rel_y2 * h)
+    roi = image_couleur[y1:y2, :]
+
     if roi.size == 0:
         return "N/A", "N/A"
-    
-    # Prétraitement
+
+    # 2. Prétraitement pour booster l'OCR
+    # On passe en gris
     gris = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    _, binaire = cv2.threshold(gris, 150, 255, cv2.THRESH_BINARY)
+    
+    # CRUCIAL : On agrandit l'image (x2 ou x3) pour que Tesseract "voit" mieux les caractères
+    gris = cv2.resize(gris, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    
+    # Binarisation adaptative (mieux que le seuil fixe à 150 pour les scans variables)
+    binaire = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
 
-    # 1. Extraction du NUMÉRO
-    conf_num = "--psm 11 -c tessedit_char_whitelist=0123456789"
-    raw_num = pytesseract.image_to_string(binaire, config=conf_num)
-    num_etudiant = "".join(re.findall(r'\d+', raw_num))
+    # 3. Extraction globale (Lettres + Chiffres)
+    # --psm 7 est souvent meilleur pour une seule ligne de texte
+    configuration = "--psm 7 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ "
+    texte_brut = pytesseract.image_to_string(binaire, config=configuration).upper()
 
-    # 2. Extraction NOM PRÉNOM
-    conf_nom = "--psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ "
-    raw_nom = pytesseract.image_to_string(binaire, config=conf_nom)
-    nom_prenom = " ".join(raw_nom.split()).strip()
+    # 4. Tri par Expressions Régulières (Regex)
+    
+    # On cherche le numéro d'étudiant : un bloc de chiffres (souvent 7 ou 8 chiffres)
+    # On prend tous les chiffres collés ou non
+    tous_les_chiffres = "".join(re.findall(r'\d', texte_brut))
+    num_etudiant = tous_les_chiffres if tous_les_chiffres else "Inconnu"
+
+    # On cherche le Nom/Prénom : tout ce qui n'est pas un chiffre, nettoyé
+    # On remplace les chiffres par rien pour ne garder que le texte
+    nom_prenom = re.sub(r'[^A-Z\s]', '', texte_brut)
+    # On nettoie les espaces multiples
+    nom_prenom = " ".join(nom_prenom.split()).strip()
+    
+    if not nom_prenom:
+        nom_prenom = "Inconnu"
 
     return num_etudiant, nom_prenom
 
-def detecter_lignes_y(binaire_omr, w):
+
+def detecter_lignes_y(binaire_omr, w,nom_prenom):
     
     # 1. Analyse de la bande de synchronisation à droite
     bande_start = int(w * 0.961) 
@@ -116,18 +175,19 @@ def detecter_lignes_y(binaire_omr, w):
     if len(tous_les_ticks) >= 43:
         return tous_les_ticks[:43]
     else:
-        print(f"Attention : {len(tous_les_ticks)} marques trouvées au lieu de 43.")
+        print(f"Attention {nom_prenom}: {len(tous_les_ticks)} marques trouvées au lieu de 43.")
         return tous_les_ticks
-    
-def detecter_colonnes_x(binaire_omr, w,paires_y):
+
+def detecter_colonnes_x(binaire_omr, w,paires_y,nom_prenom):
     # 1. On définit la zone verticale globale des questions
     # On ignore les 2 premiers ticks (Start) et le dernier (Final) pour n'avoir que les questions
     y_start = paires_y[2][0] 
     y_end = paires_y[-1][0]
     
-    zone_questions = binaire_omr[y_start:y_end, :int(w * 0.961) ]
+    zone_questions = binaire_omr[y_start:y_end,:int(w * 0.961) ]
     h_zone, w_zone = zone_questions.shape
-
+    # if nom_prenom == "SOUMARE NIOUMA":
+    #     print(f"DEBUG {nom_prenom}: zone_questions shape = {zone_questions.shape}")
 
     # 2. Projection verticale : on fait la moyenne sur la hauteur
     # Comme l'encre est blanche (255), les colonnes de cases créeront des "pics"
@@ -150,20 +210,25 @@ def detecter_colonnes_x(binaire_omr, w,paires_y):
                 en_colonne = True
             elif not actif and en_colonne:
                 largeur = x - x_debut
-                # Une colonne de questions sur ce type de document fait 
-                # environ 15-18% de la largeur totale. On filtre les parasites < 100px.
-                #if largeur > 100:
-                paires_x.append((x_debut, x))
+                if largeur > 50: # On filtre les petits bruits
+                    paires_x.append((x_debut, x))
                 en_colonne = False
                 
+        # --- LA CORRECTION MAGIQUE ---
+        # Si à la fin de l'image on est encore "en colonne", on la ferme manuellement !
+    if en_colonne:
+        paires_x.append((x_debut, len(colonnes_actives)))
         # Sécurité : on attend 5 colonnes
     if len(paires_x) != 5:
-        print(f"Attention : {len(paires_x)} colonnes trouvées. Vérifiez le seuil.")
+        print(f"Attention {nom_prenom}: {len(paires_x)} colonnes trouvées. Vérifiez le seuil.")
         
     return paires_x 
 
-def analyser_feuille(image_cv):
+def analyser_feuille(image_cv_originale):
     """Analyse une image de grille QCM."""
+    image_cv, angle = redresser_image(image_cv_originale)
+    if abs(angle) > 0.1:
+        print(f"Correction de l'inclinaison : {angle:.2f}°")
     donnees_feuille = []
     
     # 1. Prétraitement OMR (pour les cases cochées)
@@ -174,8 +239,16 @@ def analyser_feuille(image_cv):
     # 2. Extraction de l'en-tête (On envoie l'image COULEUR ici)
     num_etudiant, nom_prenom = extraire_texte(image_cv, h, w, *ZONE_IDENTITE)
 
-    paires_y = detecter_lignes_y(binaire_omr, w)
-    paires_x = detecter_colonnes_x(binaire_omr, w, paires_y)
+    paires_y = detecter_lignes_y(binaire_omr, w,nom_prenom)
+
+    # A. Image de STRUCTURE (Pour trouver les colonnes et lignes)
+    # On utilise le canal Vert (index 1 en BGR) : le rouge devient noir.
+    canal_vert = image_cv[:, :, 1]
+    flou_vert = cv2.GaussianBlur(canal_vert, (5, 5), 0)
+    # On utilise OTSU pour s'adapter automatiquement à la luminosité du scan
+    _, binaire_structure_vert = cv2.threshold(flou_vert, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    paires_x = detecter_colonnes_x(binaire_structure_vert, w, paires_y,nom_prenom)
 
     # début a 10 fin a 149
     # numéro question 13 a 39
@@ -220,24 +293,26 @@ def analyser_feuille(image_cv):
             # --- LECTURE ---
             res_l1 = [est_cochee(binaire_omr, cx, y_l1, tw, th) for cx in centres_x_abcde]
  
-            donnees_feuille.append({
-                'numéro étudiants': num_etudiant, 'nom': nom_prenom, 'question': q_numero,
-                'ligne réponse': 1, 'repentance': False,
-                'Réponse A': res_l1[0], 'Réponse B': res_l1[1], 'Réponse C': res_l1[2], 
-                'Réponse D': res_l1[3], 'Réponse E': res_l1[4]
-            })
+            if any(res_l1):
+                donnees_feuille.append({
+                    'numéro étudiants': num_etudiant, 'nom': nom_prenom, 'question': q_numero,
+                    'ligne réponse': 1, 'repentance': False,
+                    'Réponse A': res_l1[0], 'Réponse B': res_l1[1], 'Réponse C': res_l1[2], 
+                    'Réponse D': res_l1[3], 'Réponse E': res_l1[4]
+                })
 
             # Ligne 2 (Repentir)
             is_rep_coche = est_cochee(binaire_omr, x_rep, y_l2, tw, th)
             res_l2 = [est_cochee(binaire_omr, cx, y_l2, tw, th) for cx in centres_x_abcde]
 
             # if is_rep_coche or any(res_l2):
-            donnees_feuille.append({
-                'numéro étudiants': num_etudiant, 'nom': nom_prenom, 'question': q_numero,
-                'ligne réponse': 2, 'repentance': is_rep_coche,
-                'Réponse A': res_l2[0], 'Réponse B': res_l2[1], 'Réponse C': res_l2[2], 
-                'Réponse D': res_l2[3], 'Réponse E': res_l2[4]
-            })
+            if is_rep_coche or any(res_l2):
+                donnees_feuille.append({
+                    'numéro étudiants': num_etudiant, 'nom': nom_prenom, 'question': q_numero,
+                    'ligne réponse': 2, 'repentance': is_rep_coche,
+                    'Réponse A': res_l2[0], 'Réponse B': res_l2[1], 'Réponse C': res_l2[2], 
+                    'Réponse D': res_l2[3], 'Réponse E': res_l2[4]
+                })
 
     return donnees_feuille
 
