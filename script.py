@@ -67,26 +67,26 @@ def redresser_image(image_cv):
 
 
 def est_cochee(img_binaire, x_centre, y_centre, w, h):
-    """Vérifie si une case est cochée en centrant la zone de lecture."""
-    # On recule de la moitié de la largeur/hauteur pour centrer
+    """Calcule le ratio de remplissage d'une case après nettoyage."""
     x1 = int(x_centre - w // 2)
     y1 = int(y_centre - h // 2)
     x2 = x1 + w
     y2 = y1 + h
 
-    # Extraction sécurisée (pour ne pas sortir des limites de l'image)
     roi = img_binaire[max(0, y1):y2, max(0, x1):x2]
     
     if roi.size == 0:
-        return False
+        return 0.0
+
+    # --- NETTOYAGE DU BRUIT ---
+    # Supprime les pixels isolés (résidus des lettres rouges ou poussière)
+    kernel = np.ones((2, 2), np.uint8)
+    roi = cv2.morphologyEx(roi, cv2.MORPH_OPEN, kernel)
 
     total_pixels = roi.shape[0] * roi.shape[1]
     pixels_blancs = cv2.countNonZero(roi)
     
-    ratio = pixels_blancs / total_pixels
-    
-    # Seuil à 0.20 ou 0.25 pour être réactif
-    return ratio > 0.10
+    return pixels_blancs / total_pixels
 
 def extraire_texte(image_couleur, h, w,  rel_y1, rel_y2):
     """Extrait le texte et sépare intelligemment chiffres et lettres."""
@@ -225,55 +225,43 @@ def detecter_colonnes_x(binaire_omr, w,paires_y,nom_prenom):
     return paires_x 
 
 def analyser_feuille(image_cv_originale):
-    """Analyse une image de grille QCM."""
+    # --- 0. REDRESSEMENT ---
     image_cv, angle = redresser_image(image_cv_originale)
-    if abs(angle) > 0.1:
+    if abs(angle) > 0.05:
         print(f"Correction de l'inclinaison : {angle:.2f}°")
+    
+    h, w = image_cv.shape[:2]
     donnees_feuille = []
     
-    # 1. Prétraitement OMR (pour les cases cochées)
-    gris = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
-    flou = cv2.GaussianBlur(gris, (5, 5), 0)
-    _, binaire_omr = cv2.threshold(flou, 150, 255, cv2.THRESH_BINARY_INV)
-    h, w = image_cv.shape[:2]
-    # 2. Extraction de l'en-tête (On envoie l'image COULEUR ici)
-    num_etudiant, nom_prenom = extraire_texte(image_cv, h, w, *ZONE_IDENTITE)
+    # --- 1. PRÉTRAITEMENT LECTURE (OMR) ---
+    # Utilisation du canal ROUGE (index 2) pour effacer la grille rouge
+    canal_rouge = image_cv[:, :, 2]
+    flou = cv2.GaussianBlur(canal_rouge, (5, 5), 0)
+    # On binarise pour isoler le stylo sombre
+    _, binaire_omr = cv2.threshold(flou, 195, 255, cv2.THRESH_BINARY_INV)
 
-    paires_y = detecter_lignes_y(binaire_omr, w,nom_prenom)
-
-    # A. Image de STRUCTURE (Pour trouver les colonnes et lignes)
-    # On utilise le canal Vert (index 1 en BGR) : le rouge devient noir.
+    # --- 2. PRÉTRAITEMENT STRUCTURE (COLONNES) ---
     canal_vert = image_cv[:, :, 1]
-    flou_vert = cv2.GaussianBlur(canal_vert, (5, 5), 0)
-    # On utilise OTSU pour s'adapter automatiquement à la luminosité du scan
-    _, binaire_structure_vert = cv2.threshold(flou_vert, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    flou_v = cv2.GaussianBlur(canal_vert, (5, 5), 0)
+    _, binaire_struct = cv2.threshold(flou_v, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    paires_x = detecter_colonnes_x(binaire_structure_vert, w, paires_y,nom_prenom)
+    # Extraction en-tête et géométrie
+    num_etudiant, nom_prenom = extraire_texte(image_cv, h, w, *ZONE_IDENTITE)
+    paires_y = detecter_lignes_y(binaire_omr, w, nom_prenom)
+    paires_x = detecter_colonnes_x(binaire_struct, w, paires_y, nom_prenom)
 
-    # début a 10 fin a 149
-    # numéro question 13 a 39
-    # bloc repantance 23 a 39
-    # bloc de questions 44 a 60
-    # espace entre les questions 61 a 65 
-
-
-    # --- DEFINITION DES RATIOS (basés sur tes mesures) ---
+    # Paramètres de mesure
     RATIO_REPENTIR = 0.151
     RATIO_A = 0.302
     RATIO_PAS = 0.151
-    # Taille de la zone de lecture (environ 12% de la largeur du bloc)
     TAILLE_REL = 0.12
 
-    # 3. Extraction des QCM
     for bloc_idx, (x_start, x_end) in enumerate(paires_x):
         largeur_col = x_end - x_start
-        
-        # Taille de lecture adaptée à la résolution du scan
         tw = th = int(largeur_col * TAILLE_REL)
 
         for q_in_col in range(20):
             q_numero = (bloc_idx * 20) + (q_in_col + 1)
-            
             idx_l1 = 2 + (q_in_col * 2)
             idx_l2 = idx_l1 + 1
             if idx_l2 >= len(paires_y): break
@@ -281,18 +269,20 @@ def analyser_feuille(image_cv_originale):
             y_l1 = (paires_y[idx_l1][0] + paires_y[idx_l1][1]) // 2
             y_l2 = (paires_y[idx_l2][0] + paires_y[idx_l2][1]) // 2
 
-            # --- CALCUL DES X PAR RATIO ---
+            centres_x_abcde = [int(x_start + (largeur_col * (RATIO_A + i * RATIO_PAS))) for i in range(5)]
             x_rep = int(x_start + (largeur_col * RATIO_REPENTIR))
-            
-            # Centres des cases A, B, C, D, E
-            centres_x_abcde = [
-                int(x_start + (largeur_col * (RATIO_A + i * RATIO_PAS)))
-                for i in range(5)
-            ]
 
-            # --- LECTURE ---
-            res_l1 = [est_cochee(binaire_omr, cx, y_l1, tw, th) for cx in centres_x_abcde]
- 
+# --- ANALYSE LIGNE 1 ---
+            ratios_l1 = [est_cochee(binaire_omr, cx, y_l1, tw, th) for cx in centres_x_abcde]
+            
+            # 1. On prend la valeur la plus basse de la ligne
+            valeur_min_l1 = min(ratios_l1)
+            # 2. On la plafonne à 3% (0.03) max pour éviter que 5 cases cochées ne faussent le calcul
+            bruit_de_fond_l1 = min(valeur_min_l1, 0.03)
+            
+            # Une case est cochée si elle a au moins 4% ET qu'elle dépasse le (bruit + 5%)
+            res_l1 = [ (r > 0.04 and r > (bruit_de_fond_l1 + 0.05)) for r in ratios_l1 ]
+
             if any(res_l1):
                 donnees_feuille.append({
                     'numéro étudiants': num_etudiant, 'nom': nom_prenom, 'question': q_numero,
@@ -301,11 +291,16 @@ def analyser_feuille(image_cv_originale):
                     'Réponse D': res_l1[3], 'Réponse E': res_l1[4]
                 })
 
-            # Ligne 2 (Repentir)
-            is_rep_coche = est_cochee(binaire_omr, x_rep, y_l2, tw, th)
-            res_l2 = [est_cochee(binaire_omr, cx, y_l2, tw, th) for cx in centres_x_abcde]
+            # --- ANALYSE LIGNE 2 (REPENTIR) ---
+            ratio_rep = est_cochee(binaire_omr, x_rep, y_l2, tw, th)
+            ratios_l2 = [est_cochee(binaire_omr, cx, y_l2, tw, th) for cx in centres_x_abcde]
+            
+            valeur_min_l2 = min(ratios_l2)
+            bruit_de_fond_l2 = min(valeur_min_l2, 0.03)
+            
+            is_rep_coche = (ratio_rep > 0.08)
+            res_l2 = [ (r > 0.04 and r > (bruit_de_fond_l2 + 0.05)) for r in ratios_l2 ]
 
-            # if is_rep_coche or any(res_l2):
             if is_rep_coche or any(res_l2):
                 donnees_feuille.append({
                     'numéro étudiants': num_etudiant, 'nom': nom_prenom, 'question': q_numero,
